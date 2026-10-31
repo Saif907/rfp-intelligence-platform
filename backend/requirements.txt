@@ -1,0 +1,25 @@
+fastapi
+uvicorn[standard]
+python-multipart
+
+# =========================
+# Data Validation & Config
+# =========================
+pydantic
+pydantic-settings
+python-dotenv
+
+ipykernel
+
+
+# =========================
+# PDF Parser
+# =========================
+pdfplumber
+pymupdf4llm
+pandas
+
+httpx
+langchain_core
+langgraph
+langchain_openai

@@ -1,0 +1,155 @@
+# ==============================================================================
+# SECRETS & ENVIRONMENT VARIABLES (CRITICAL)
+# ==============================================================================
+# Ignore all environment files (dev, local, test, prod)
+.env*
+# Explicitly keep example template tracked for onboarding and deployment
+!.env.example
+
+# Service accounts, API private keys, and certificates (GCP, Supabase, OpenAI, etc.)
+*service_account*.json
+*credentials*.json
+gcp-key*.json
+client_secrets*.json
+*.pem
+*.key
+*.cert
+*.crt
+
+# ==============================================================================
+# PYTHON RUNTIME & BYTECODE
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / Packaging
+build/
+dist/
+*.egg-info/
+*.egg
+develop-eggs/
+eggs/
+parts/
+var/
+sdist/
+wheels/
+
+# ==============================================================================
+# VIRTUAL ENVIRONMENTS
+# ==============================================================================
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==============================================================================
+# CODE QUALITY, LINTERS & TYPE CHECKERS
+# ==============================================================================
+# Ruff cache (configured in pyproject.toml)
+.ruff_cache/
+
+# Mypy cache (configured in pyproject.toml)
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pytest & Coverage (configured in pyproject.toml)
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+nosetests.xml
+
+# ==============================================================================
+# VECTOR DATABASES & LOCAL DATA STORES
+# ==============================================================================
+# Local Qdrant vector database storage (persisted collections, segments, WAL)
+qdrant_storage/
+
+# Local Chroma or generic vector caches
+chroma_db/
+.chroma/
+
+# Local relational/embedded databases
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+
+# ==============================================================================
+# EMBEDDINGS & MODEL WEIGHT CACHES
+# ==============================================================================
+# FastEmbed, HuggingFace, ONNX, and Docling local model downloads
+.cache/
+models/
+hf_cache/
+fastembed_cache/
+
+# ==============================================================================
+# RAW BOOKS, DATASETS & INGESTION ARTIFACTS
+# ==============================================================================
+# Raw book files and parsed documents
+data/
+raw_books/
+uploads/
+parsed_books/
+temp/
+tmp/
+
+# Document formats (prevents accidental commits of large binary files)
+*.pdf
+*.epub
+*.mobi
+*.azw3
+*.djvu
+
+# Pipeline run outputs & benchmarks
+outputs/
+evaluation_results/
+benchmark_results/
+
+# ==============================================================================
+# JUPYTER NOTEBOOKS & SCRATCHPADS
+# ==============================================================================
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+# ==============================================================================
+# LOGS & RUNTIME DIAGNOSTICS
+# ==============================================================================
+*.log
+logs/
+
+# ==============================================================================
+# OPERATING SYSTEM & IDE ARTIFACTS
+# ==============================================================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# Editors & IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# AI Assistant artifacts
+CLAUDE.md
+
+notebooks/
+
+env.yaml
