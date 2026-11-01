@@ -93,6 +93,14 @@ class ParsedPage(BaseModel):
         default=False,
         description="True if PyMuPDF block layout recovery was triggered to prevent data loss",
     )
+    ocr_applied: bool = Field(
+        default=False,
+        description="True if Chandra 2 OCR was executed to extract layout and text",
+    )
+    extraction_method: str = Field(
+        default="digital",
+        description="Extraction provenance: 'digital', 'recovered_blocks', 'chandra_ocr', or 'fallback'",
+    )
 
 
 class ParsedDocument(BaseModel):
@@ -119,6 +127,11 @@ class ParsedDocument(BaseModel):
         ...,
         ge=0,
         description="Number of pages where border-box layout recovery was applied",
+    )
+    ocr_pages_count: int = Field(
+        default=0,
+        ge=0,
+        description="Number of pages processed with Chandra 2 OCR",
     )
     parse_duration_seconds: float = Field(
         ...,

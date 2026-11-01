@@ -35,3 +35,7 @@ class UnsupportedFormatError(IngestionError):
 class PDFParsingError(IngestionError):
     """Raised when a PDF fails to parse during layout or table extraction."""
 
+
+class HTMLParsingError(IngestionError):
+    """Raised when an HTML file fails to parse during DOM or table extraction."""
+

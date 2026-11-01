@@ -4,14 +4,23 @@ from dotenv import load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Ensure .env values are populated in os.environ for external SDKs like LangSmith
-load_dotenv()
+# Locate .env from backend directory or project root
+_BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
+_BACKEND_ENV = _BACKEND_DIR / ".env"
+_ROOT_ENV = _BACKEND_DIR.parent / ".env"
+
+if _BACKEND_ENV.exists():
+    load_dotenv(_BACKEND_ENV)
+elif _ROOT_ENV.exists():
+    load_dotenv(_ROOT_ENV)
+else:
+    load_dotenv()
 
 
 class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(_BACKEND_ENV, _ROOT_ENV, ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -33,8 +42,6 @@ class Settings(BaseSettings):
 
     GEMINI_MODEL: str = "gemini-3.1-flash-lite"
 
-
-
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
 
     OPENROUTER_API_KEY: str | None = None
@@ -52,7 +59,6 @@ class Settings(BaseSettings):
     OPENROUTER_SEARCH_MODEL: str | None = (
         "perplexity/sonar"
     )
-
 
     GROQ_BASE_URL: str = "https://api.groq.com/openai/v1"
 

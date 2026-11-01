@@ -9,6 +9,7 @@ Combines:
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,7 @@ from ingestion.models import (
     ParsedDocument,
     ParsedPage,
 )
+from ingestion.ocr import ChandraOCRClient
 
 logger = get_logger(__name__)
 
@@ -102,16 +104,49 @@ class PDFParser:
         return cleaned_tables
 
     @classmethod
+    def _extract_markdown_tables(cls, markdown_text: str) -> list[list[list[str]]]:
+        """Extracts structured 2D table grids from Markdown text (e.g., from OCR output)."""
+        tables: list[list[str]] = []
+        lines = markdown_text.splitlines()
+        current_table: list[str] = []
+
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("|") and stripped.endswith("|"):
+                current_table.append(stripped)
+            else:
+                if len(current_table) >= 3:
+                    tables.append(current_table)
+                current_table = []
+        if len(current_table) >= 3:
+            tables.append(current_table)
+
+        parsed_grids: list[list[list[str]]] = []
+        for raw_tbl in tables:
+            grid: list[list[str]] = []
+            for row in raw_tbl:
+                cells = [c.strip() for c in row.strip("|").split("|")]
+                # Skip markdown separator rows like |---|---|
+                if all(re.match(r"^:?-+:?$", c) for c in cells if c):
+                    continue
+                grid.append(cells)
+            if len(grid) >= 2 and max(len(r) for r in grid) >= 2:
+                parsed_grids.append(grid)
+        return parsed_grids
+
+    @classmethod
     def parse_document(
         cls,
         discovered_doc: DiscoveredDocument,
         max_pages: int | None = None,
+        enable_ocr: bool = True,
     ) -> ParsedDocument:
         """Parses a discovered PDF document into a validated ParsedDocument model.
 
         Args:
             discovered_doc: Validated DiscoveredDocument instance.
             max_pages: Optional maximum number of pages to parse (for fast sampling).
+            enable_ocr: Whether to run Chandra 2 OCR on scanned/image pages.
 
         Returns:
             ParsedDocument with physical page pinning, layout markdown, and tables.
@@ -133,6 +168,7 @@ class PDFParser:
             doc_type=discovered_doc.doc_type,
             addendum_number=discovered_doc.addendum_number,
             max_pages=max_pages,
+            enable_ocr=enable_ocr,
         )
 
     @classmethod
@@ -143,6 +179,7 @@ class PDFParser:
         doc_type: DocumentType = DocumentType.RFP,
         addendum_number: int | None = None,
         max_pages: int | None = None,
+        enable_ocr: bool = True,
     ) -> ParsedDocument:
         """Parses a PDF from a filesystem path into a validated ParsedDocument model.
 
@@ -152,6 +189,7 @@ class PDFParser:
             doc_type: Procurement document role.
             addendum_number: Addendum number if document is an amendment.
             max_pages: Optional maximum number of pages to parse.
+            enable_ocr: Whether to run Chandra 2 OCR on scanned/image pages.
 
         Returns:
             Validated ParsedDocument with page-level metrics and tables.
@@ -209,6 +247,8 @@ class PDFParser:
             total_headings_count = 0
             scanned_count = 0
             recovered_count = 0
+            ocr_count = 0
+            ocr_client = ChandraOCRClient() if enable_ocr else None
 
             for p_idx in zero_idx_pages:
                 page_num = p_idx + 1
@@ -236,9 +276,27 @@ class PDFParser:
                     )
 
                 char_count = len(page_md)
-                is_scanned = len(raw_page_text) < 30 and len(page_md) < 30
+                # Multi-signal scanned/form detection:
+                # Identifies scanned images or vector-rendered forms (<40 text chars with drawings or images),
+                # preventing wasted OCR calls on truly blank separator pages.
+                has_visual_content = bool(page_obj.get_images() or page_obj.get_drawings())
+                is_scanned = len(raw_page_text) < 40 and len(page_md) < 40 and has_visual_content
+                ocr_applied = False
                 if is_scanned:
                     scanned_count += 1
+                    # Chandra 2 OCR Integration for scanned/vector-only forms
+                    if enable_ocr and ocr_client and ocr_client.is_available:
+                        logger.info(
+                            "Scanned page %d detected in '%s'; triggering Chandra 2 OCR...",
+                            page_num,
+                            resolved_path.name,
+                        )
+                        ocr_md = ocr_client.ocr_page(doc, p_idx)
+                        if ocr_md:
+                            page_md = ocr_md
+                            char_count = len(page_md)
+                            ocr_applied = True
+                            ocr_count += 1
 
                 headings = cls._extract_headings(page_md)
                 total_headings_count += len(headings)
@@ -264,7 +322,19 @@ class PDFParser:
                         exc,
                     )
 
+                # Fallback to Markdown table extraction when OCR was applied and native vector table finder found none
+                if ocr_applied and not page_tables:
+                    page_tables = cls._extract_markdown_tables(page_md)
+
                 total_tables_count += len(page_tables)
+
+                # Determine extraction method provenance for auditability
+                if ocr_applied:
+                    extraction_method = "chandra_ocr"
+                elif recovery_applied:
+                    extraction_method = "recovered_blocks"
+                else:
+                    extraction_method = "digital"
 
                 parsed_pages.append(
                     ParsedPage(
@@ -276,12 +346,14 @@ class PDFParser:
                         has_tables=bool(page_tables),
                         is_scanned=is_scanned,
                         recovery_applied=recovery_applied,
+                        ocr_applied=ocr_applied,
+                        extraction_method=extraction_method,
                     )
                 )
 
         duration = round(time.perf_counter() - start_time, 3)
         logger.info(
-            "Parsed '%s' in %.3fs (%d pages, %d chars, %d tables, %d headings, %d recovered, %d scanned)",
+            "Parsed '%s' in %.3fs (%d pages, %d chars, %d tables, %d headings, %d recovered, %d scanned, %d ocr)",
             resolved_path.name,
             duration,
             len(parsed_pages),
@@ -290,6 +362,7 @@ class PDFParser:
             total_headings_count,
             recovered_count,
             scanned_count,
+            ocr_count,
         )
 
         return ParsedDocument(
@@ -305,6 +378,7 @@ class PDFParser:
             total_headings=total_headings_count,
             scanned_pages_count=scanned_count,
             recovered_pages_count=recovered_count,
+            ocr_pages_count=ocr_count,
             parse_duration_seconds=duration,
         )
 

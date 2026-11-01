@@ -110,6 +110,7 @@ tmp/
 
 # Pipeline run outputs & benchmarks
 outputs/
+output/
 evaluation_results/
 benchmark_results/
 
