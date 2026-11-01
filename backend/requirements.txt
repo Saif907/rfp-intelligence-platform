@@ -11,15 +11,16 @@ python-dotenv
 
 ipykernel
 
-
 # =========================
-# PDF Parser
+# PDF Parser & HTML Extraction
 # =========================
 pdfplumber
 pymupdf4llm
 pandas
+beautifulsoup4
 
 httpx
 langchain_core
 langgraph
 langchain_openai
+asyncio

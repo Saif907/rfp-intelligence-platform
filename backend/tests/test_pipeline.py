@@ -85,7 +85,9 @@ class TestIngestionPipeline(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_out:
             # Sample parse of bid2
             docs = self.pipeline.process_bid_folder(self.bid2_dir, bid_id="Bid2")
-            manifest_path = self.pipeline.export_artifacts(docs, output_dir=tmp_out)
+            manifest_path = self.pipeline.export_artifacts(
+                docs, output_dir=tmp_out, export_json=True
+            )
 
             self.assertTrue(manifest_path.exists())
             manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))

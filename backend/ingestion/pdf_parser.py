@@ -1,10 +1,11 @@
-"""Production-grade PDF parsing engine for RFP intelligence.
+"""Production-grade PDF parsing engine for procurement intelligence.
 
 Combines:
-1. PyMuPDF4LLM structural layout (headings, lists, bolding).
-2. Zero-Loss Layout Recovery (recovers text when single-cell border boxes swallow content).
-3. PyMuPDF table finder with Banner Splitting (decouples composite government forms).
-4. Physical page pinning and scanned page categorization.
+1. Agnostic Page Layout Router for intelligent tier selection (simple_text, chandra_fast, chandra_balanced).
+2. Chandra 2 Vision OCR with HTML extraction (preserves tables without merged cell duplication).
+3. Geometric y0-coordinate block and table interleaving (keeps tables anchored to their section headers).
+4. Automated layout cleaning (strips repeated running headers, repairs isolated bullets, deduplicates rows).
+5. Physical page pinning and complete audit provenance.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import pymupdf
 import pymupdf4llm
 
 from app.core.logging import get_logger
+from ingestion.cleaner import DocumentCleaner
 from ingestion.exceptions import (
     CorruptedDocumentError,
     EmptyDocumentError,
@@ -31,13 +33,18 @@ from ingestion.models import (
     ParsedDocument,
     ParsedPage,
 )
-from ingestion.ocr import ChandraOCRClient
+from ingestion.ocr import ChandraOCRClient, HTMLLayoutExtractor
+from ingestion.router import (
+    PageLayoutRouter,
+    PageProcessingMode,
+    default_router,
+)
 
 logger = get_logger(__name__)
 
 
 class PDFParser:
-    """Production-grade PDF parsing engine with layout recovery and table extraction."""
+    """Production PDF parsing engine combining PyMuPDF layout, vertical interleaving, and Chandra OCR."""
 
     @staticmethod
     def _extract_headings(md_text: str) -> list[str]:
@@ -47,92 +54,62 @@ class PDFParser:
             stripped = line.strip()
             if stripped.startswith("#"):
                 heading_title = stripped.lstrip("#").strip()
-                if heading_title:
+                if heading_title and len(heading_title) < 150:
                     headings.append(heading_title)
         return headings
 
     @staticmethod
-    def _split_composite_tables(
-        raw_rows: list[list[str | None]],
-    ) -> list[list[list[str]]]:
-        """Splits stacked composite form tables at full-width banner rows and drops empty columns.
+    def _is_decorative_table(
+        bbox: tuple[float, float, float, float],
+        row_count: int,
+        col_count: int,
+        page_rect: pymupdf.Rect,
+    ) -> bool:
+        """Determines if a detected table is actually an aesthetic page border/frame container."""
+        tbl_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+        page_area = max(1.0, page_rect.width * page_rect.height)
+        h = bbox[3] - bbox[1]
+        avg_row_h = h / max(1, row_count)
+        cov = tbl_area / page_area
+        return cov > 0.45 and col_count <= 3 and avg_row_h > 65.0
 
-        Government RFPs often bundle disparate sections (e.g., Contacts, Delivery Info,
-        Hardware Specs, Warranty) into a single contiguous bordered grid. This method
-        isolates each section into an independent tabular matrix.
+    @staticmethod
+    def _interleave_blocks_and_tables(
+        page_obj: pymupdf.Page,
+        raw_tables: list[list[list[str]]],
+        table_bboxes: list[tuple[float, float, float, float]],
+    ) -> str:
+        """Interleaves text blocks and native tables by vertical y0 coordinate.
+
+        Guarantees that tables remain anchored immediately beneath their respective
+        section or line item titles instead of being dumped at the bottom of the page.
         """
-        sub_tables: list[list[list[str]]] = []
-        current: list[list[str]] = []
+        blocks = [b for b in page_obj.get_text("blocks") if b[4].strip()]
+        items: list[tuple[float, str, Any]] = []
 
-        for row in raw_rows:
-            cells = [c.strip().replace("\n", " ") if c else "" for c in row]
-            non_empty = [c for c in cells if c]
-            if not non_empty:
+        # Add text blocks (filtering out running headers/footers)
+        for b in blocks:
+            text = b[4].strip()
+            if any(pat.search(text) for pat in DocumentCleaner.RUNNING_HEADER_PATTERNS):
                 continue
+            items.append((b[1], "text", text))
 
-            # Full-width banner header row (e.g. repeated banner or single title spanning columns)
-            is_banner = len(set(non_empty)) == 1 and len(non_empty[0]) > 8
-            if is_banner:
-                if current:
-                    sub_tables.append(current)
-                    current = []
-                current.append([non_empty[0]])
+        # Add tables
+        for bbox, tbl in zip(table_bboxes, raw_tables):
+            items.append((bbox[1], "table", tbl))
+
+        items.sort(key=lambda x: x[0])
+
+        elements: list[str] = []
+        for _, itype, data in items:
+            if itype == "text":
+                elements.append(data)
             else:
-                current.append(cells)
+                md_tbl = HTMLLayoutExtractor._grid_to_markdown(data)
+                if md_tbl:
+                    elements.append(md_tbl)
 
-        if current:
-            sub_tables.append(current)
-
-        # Drop 100% empty columns across each sub-table
-        cleaned_tables: list[list[list[str]]] = []
-        for tbl in sub_tables:
-            if len(tbl) <= 1:
-                cleaned_tables.append(tbl)
-                continue
-            num_cols = max(len(r) for r in tbl)
-            cols = [
-                [r[i] if i < len(r) else "" for r in tbl[1:]]
-                for i in range(num_cols)
-            ]
-            valid_indices = [i for i, col in enumerate(cols) if any(c for c in col)]
-            clean_tbl = [
-                [r[i] if i < len(r) else "" for i in valid_indices]
-                for r in tbl
-            ]
-            cleaned_tables.append(clean_tbl)
-
-        return cleaned_tables
-
-    @classmethod
-    def _extract_markdown_tables(cls, markdown_text: str) -> list[list[list[str]]]:
-        """Extracts structured 2D table grids from Markdown text (e.g., from OCR output)."""
-        tables: list[list[str]] = []
-        lines = markdown_text.splitlines()
-        current_table: list[str] = []
-
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith("|") and stripped.endswith("|"):
-                current_table.append(stripped)
-            else:
-                if len(current_table) >= 3:
-                    tables.append(current_table)
-                current_table = []
-        if len(current_table) >= 3:
-            tables.append(current_table)
-
-        parsed_grids: list[list[list[str]]] = []
-        for raw_tbl in tables:
-            grid: list[list[str]] = []
-            for row in raw_tbl:
-                cells = [c.strip() for c in row.strip("|").split("|")]
-                # Skip markdown separator rows like |---|---|
-                if all(re.match(r"^:?-+:?$", c) for c in cells if c):
-                    continue
-                grid.append(cells)
-            if len(grid) >= 2 and max(len(r) for r in grid) >= 2:
-                parsed_grids.append(grid)
-        return parsed_grids
+        return "\n\n".join(elements)
 
     @classmethod
     def parse_document(
@@ -140,25 +117,12 @@ class PDFParser:
         discovered_doc: DiscoveredDocument,
         max_pages: int | None = None,
         enable_ocr: bool = True,
+        router: PageLayoutRouter | None = None,
     ) -> ParsedDocument:
-        """Parses a discovered PDF document into a validated ParsedDocument model.
-
-        Args:
-            discovered_doc: Validated DiscoveredDocument instance.
-            max_pages: Optional maximum number of pages to parse (for fast sampling).
-            enable_ocr: Whether to run Chandra 2 OCR on scanned/image pages.
-
-        Returns:
-            ParsedDocument with physical page pinning, layout markdown, and tables.
-
-        Raises:
-            UnsupportedFormatError: If the document is not a PDF.
-            CorruptedDocumentError: If PyMuPDF fails to open or read the file.
-            PDFParsingError: If an unhandled parsing error occurs.
-        """
+        """Parses a discovered PDF document into a validated ParsedDocument model."""
         if discovered_doc.file_type != FileType.PDF:
             raise UnsupportedFormatError(
-                f"Cannot parse non-PDF file format '{discovered_doc.file_type}' with PDFParser",
+                f"Cannot parse non-PDF format '{discovered_doc.file_type}' with PDFParser",
                 file_path=discovered_doc.file_path,
             )
 
@@ -169,6 +133,7 @@ class PDFParser:
             addendum_number=discovered_doc.addendum_number,
             max_pages=max_pages,
             enable_ocr=enable_ocr,
+            router=router,
         )
 
     @classmethod
@@ -180,20 +145,9 @@ class PDFParser:
         addendum_number: int | None = None,
         max_pages: int | None = None,
         enable_ocr: bool = True,
+        router: PageLayoutRouter | None = None,
     ) -> ParsedDocument:
-        """Parses a PDF from a filesystem path into a validated ParsedDocument model.
-
-        Args:
-            file_path: Filesystem path to the PDF file.
-            bid_id: Unique bid identifier.
-            doc_type: Procurement document role.
-            addendum_number: Addendum number if document is an amendment.
-            max_pages: Optional maximum number of pages to parse.
-            enable_ocr: Whether to run Chandra 2 OCR on scanned/image pages.
-
-        Returns:
-            Validated ParsedDocument with page-level metrics and tables.
-        """
+        """Parses a PDF into a validated ParsedDocument model with layout-anchored tables."""
         resolved_path = Path(file_path).resolve()
         if not resolved_path.exists():
             raise FileNotFoundError(f"PDF file does not exist: {resolved_path}")
@@ -214,6 +168,9 @@ class PDFParser:
                 file_path=resolved_path,
             ) from exc
 
+        page_router = router or default_router
+        ocr_client = ChandraOCRClient() if enable_ocr else None
+
         with doc:
             doc_len = len(doc)
             if doc_len == 0:
@@ -225,9 +182,9 @@ class PDFParser:
             pages_to_process = min(doc_len, max_pages) if max_pages else doc_len
             zero_idx_pages = list(range(pages_to_process))
 
-            # 1. Structural layout extraction via pymupdf4llm
+            # Baseline structural layout extraction via pymupdf4llm
             try:
-                chunks: list[dict[str, Any]] = pymupdf4llm.to_markdown(
+                llm_chunks: list[dict[str, Any]] = pymupdf4llm.to_markdown(
                     doc,
                     pages=zero_idx_pages,
                     page_chunks=True,
@@ -235,12 +192,8 @@ class PDFParser:
                     write_images=False,
                 )
             except Exception as exc:
-                logger.warning(
-                    "PyMuPDF4LLM failed on '%s': %s. Falling back to native block extraction.",
-                    resolved_path.name,
-                    exc,
-                )
-                chunks = []
+                logger.warning("PyMuPDF4LLM failed on '%s': %s", resolved_path.name, exc)
+                llm_chunks = []
 
             parsed_pages: list[ParsedPage] = []
             total_tables_count = 0
@@ -248,99 +201,121 @@ class PDFParser:
             scanned_count = 0
             recovered_count = 0
             ocr_count = 0
-            ocr_client = ChandraOCRClient() if enable_ocr else None
 
             for p_idx in zero_idx_pages:
                 page_num = p_idx + 1
                 page_obj = doc[p_idx]
                 raw_page_text = page_obj.get_text("text").strip()
 
-                chunk_data = chunks[p_idx] if p_idx < len(chunks) else {}
-                page_md = chunk_data.get("text", "").strip()
+                chunk_data = llm_chunks[p_idx] if p_idx < len(llm_chunks) else {}
+                llm_md = chunk_data.get("text", "").strip()
 
-                # Zero-Loss Layout Recovery:
-                # If pymupdf4llm drops text due to outer border boxes, recover text
-                # from native PyMuPDF blocks to prevent loss of critical specs.
-                recovery_applied = False
-                if len(page_md) < 50 and len(raw_page_text) >= 50:
-                    blocks = page_obj.get_text("blocks")
-                    recovered_lines = [b[4].strip() for b in blocks if b[4].strip()]
-                    page_md = "\n\n".join(recovered_lines)
-                    recovery_applied = True
-                    recovered_count += 1
-                    logger.debug(
-                        "Layout recovery triggered on page %d of '%s' (recovered %d chars)",
-                        page_num,
-                        resolved_path.name,
-                        len(page_md),
-                    )
+                # Evaluate layout geometry via agnostic router
+                route_result = page_router.route_page(page_obj, page_number=page_num)
+                target_mode = route_result.mode
+                metrics = route_result.metrics
 
-                char_count = len(page_md)
-                # Multi-signal scanned/form detection:
-                # Identifies scanned images or vector-rendered forms (<40 text chars with drawings or images),
-                # preventing wasted OCR calls on truly blank separator pages.
-                has_visual_content = bool(page_obj.get_images() or page_obj.get_drawings())
-                is_scanned = len(raw_page_text) < 40 and len(page_md) < 40 and has_visual_content
-                ocr_applied = False
-                if is_scanned:
-                    scanned_count += 1
-                    # Chandra 2 OCR Integration for scanned/vector-only forms
-                    if enable_ocr and ocr_client and ocr_client.is_available:
-                        logger.info(
-                            "Scanned page %d detected in '%s'; triggering Chandra 2 OCR...",
-                            page_num,
-                            resolved_path.name,
-                        )
-                        ocr_md = ocr_client.ocr_page(doc, p_idx)
-                        if ocr_md:
-                            page_md = ocr_md
-                            char_count = len(page_md)
-                            ocr_applied = True
-                            ocr_count += 1
-
-                headings = cls._extract_headings(page_md)
-                total_headings_count += len(headings)
-
-                # 2. Native Table Finder & Banner Splitting
+                page_md = ""
                 page_tables: list[list[list[str]]] = []
+                extraction_method = "digital"
+                recovery_applied = False
+                ocr_applied = False
+                has_zero_text = metrics.text_length < 60
+                has_visual_content = metrics.vector_paths > 20 or metrics.img_coverage > 0.30
+                is_scanned = (metrics.img_coverage > 0.60 and metrics.text_length < 200) or (
+                    has_zero_text and has_visual_content
+                )
+
+                # 1. Check if page warrants Chandra OCR (scanned, complex forms, or border-box text drop)
+                border_box_swallowed = len(llm_md) < 50 and len(raw_page_text) >= 50
+                warrants_ocr = (
+                    is_scanned
+                    or (target_mode == PageProcessingMode.CHANDRA_BALANCED)
+                    or (target_mode == PageProcessingMode.CHANDRA_FAST and metrics.text_length < 100)
+                    or border_box_swallowed
+                )
+
+                if enable_ocr and ocr_client and ocr_client.is_available and warrants_ocr:
+                    ocr_mode = "balanced" if (target_mode == PageProcessingMode.CHANDRA_BALANCED or is_scanned) else "fast"
+                    logger.debug(
+                        "Routing page %d to Chandra OCR (mode=%s, reason=%s)",
+                        page_num,
+                        ocr_mode,
+                        route_result.reason,
+                    )
+                    ocr_result = ocr_client.ocr_page(
+                        doc,
+                        page_index_0based=p_idx,
+                        mode=ocr_mode,
+                        exclude_headers_footers=True,
+                    )
+                    if ocr_result and len(ocr_result.strip()) > 20:
+                        page_md = ocr_result.strip()
+                        ocr_applied = True
+                        ocr_count += 1
+                        extraction_method = f"chandra_{ocr_mode}"
+
+                # 2. Native Table Detection & Interleaving Fallback
                 try:
                     tabs = page_obj.find_tables()
-                    if tabs.tables:
+                    native_tables: list[list[list[str]]] = []
+                    table_bboxes: list[tuple[float, float, float, float]] = []
+                    if tabs and tabs.tables:
                         for t in tabs.tables:
-                            raw_data = t.extract()
-                            if raw_data:
-                                sub_grids = cls._split_composite_tables(raw_data)
-                                for grid in sub_grids:
-                                    # Retain structured tables with >= 2 rows and >= 2 columns
-                                    if len(grid) >= 2 and max(len(r) for r in grid) >= 2:
-                                        page_tables.append(grid)
-                except Exception as exc:
-                    logger.warning(
-                        "Table extraction failed on page %d of '%s': %s",
-                        page_num,
-                        resolved_path.name,
-                        exc,
-                    )
+                            if cls._is_decorative_table(t.bbox, t.row_count, t.col_count, page_obj.rect):
+                                continue
+                            data = t.extract()
+                            if data and len(data) >= 1:
+                                # Clean cells
+                                clean_grid = [
+                                    [c.strip().replace("\n", " ") if c else "" for c in row]
+                                    for row in data
+                                ]
+                                if any(any(c for c in r) for r in clean_grid):
+                                    native_tables.append(clean_grid)
+                                    table_bboxes.append(t.bbox)
+                except Exception:
+                    native_tables = []
+                    table_bboxes = []
 
-                # Fallback to Markdown table extraction when OCR was applied and native vector table finder found none
-                if ocr_applied and not page_tables:
-                    page_tables = cls._extract_markdown_tables(page_md)
+                # If OCR was not applied, assemble from digital/PyMuPDF blocks
+                if not page_md:
+                    if border_box_swallowed:
+                        # Zero-loss layout recovery with vertical interleaving
+                        page_md = cls._interleave_blocks_and_tables(
+                            page_obj, native_tables, table_bboxes
+                        )
+                        recovery_applied = True
+                        recovered_count += 1
+                        extraction_method = "recovered_blocks"
+                    elif native_tables and len(native_tables) > 1:
+                        # Interleave tables vertically so pricing line tables don't get displaced
+                        page_md = cls._interleave_blocks_and_tables(
+                            page_obj, native_tables, table_bboxes
+                        )
+                        extraction_method = "digital"
+                    else:
+                        page_md = llm_md if llm_md else raw_page_text
+                        extraction_method = "digital"
 
+                    page_tables = native_tables
+
+                if is_scanned:
+                    scanned_count += 1
+
+                # 3. Post-Extraction Sanitization & Cleaning
+                page_md = DocumentCleaner.clean_page_markdown(page_md)
+
+                # Extract headings
+                headings = cls._extract_headings(page_md)
+                total_headings_count += len(headings)
                 total_tables_count += len(page_tables)
-
-                # Determine extraction method provenance for auditability
-                if ocr_applied:
-                    extraction_method = "chandra_ocr"
-                elif recovery_applied:
-                    extraction_method = "recovered_blocks"
-                else:
-                    extraction_method = "digital"
 
                 parsed_pages.append(
                     ParsedPage(
                         page_number=page_num,
                         markdown=page_md,
-                        char_count=char_count,
+                        char_count=len(page_md),
                         headings=headings,
                         tables=page_tables,
                         has_tables=bool(page_tables),
@@ -352,17 +327,18 @@ class PDFParser:
                 )
 
         duration = round(time.perf_counter() - start_time, 3)
+        total_chars = sum(p.char_count for p in parsed_pages)
+
         logger.info(
-            "Parsed '%s' in %.3fs (%d pages, %d chars, %d tables, %d headings, %d recovered, %d scanned, %d ocr)",
+            "Parsed '%s' in %.3fs (%d pages, %d chars, %d tables, %d headings, %d ocr, %d recovered)",
             resolved_path.name,
             duration,
             len(parsed_pages),
-            sum(p.char_count for p in parsed_pages),
+            total_chars,
             total_tables_count,
             total_headings_count,
-            recovered_count,
-            scanned_count,
             ocr_count,
+            recovered_count,
         )
 
         return ParsedDocument(
@@ -373,7 +349,7 @@ class PDFParser:
             addendum_number=addendum_number,
             total_pages=len(parsed_pages),
             pages=parsed_pages,
-            total_characters=sum(p.char_count for p in parsed_pages),
+            total_characters=total_chars,
             total_tables=total_tables_count,
             total_headings=total_headings_count,
             scanned_pages_count=scanned_count,
@@ -381,4 +357,3 @@ class PDFParser:
             ocr_pages_count=ocr_count,
             parse_duration_seconds=duration,
         )
-

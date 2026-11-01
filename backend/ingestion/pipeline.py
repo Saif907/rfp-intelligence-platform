@@ -15,10 +15,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 import sys
 import time
-from pathlib import Path
 from typing import Any
+
+# Ensure backend directory is in sys.path when invoked directly as a script
+_BACKEND_DIR = Path(__file__).resolve().parent.parent
+_PROJECT_ROOT = _BACKEND_DIR.parent
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
 
 from app.core.logging import get_logger
 from ingestion.classifier import DocumentClassifier
@@ -232,7 +238,17 @@ class IngestionPipeline:
         """
         base_dir = Path(data_dir).resolve()
         if not base_dir.exists():
-            raise FileNotFoundError(f"Data directory does not exist: {base_dir}")
+            # Check relative to backend parent directory if running from within backend/
+            parent_candidate = (Path.cwd().parent / data_dir).resolve()
+            if parent_candidate.exists():
+                base_dir = parent_candidate
+            else:
+                # Also check relative to project root based on file location
+                module_root_candidate = (_PROJECT_ROOT / data_dir).resolve()
+                if module_root_candidate.exists():
+                    base_dir = module_root_candidate
+                else:
+                    raise FileNotFoundError(f"Data directory does not exist: {base_dir}")
 
         bid_dirs = [d for d in base_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
         bid_dirs.sort(key=lambda p: p.name)
@@ -255,24 +271,29 @@ class IngestionPipeline:
         self,
         parsed_documents: dict[str, list[ParsedDocument]] | list[ParsedDocument],
         output_dir: Path | str,
+        export_json: bool = False,
     ) -> Path:
-        """Serializes parsed documents to validated JSON and clean Markdown.
+        """Serializes parsed documents to clean Markdown (and optionally JSON).
 
         Structure:
             <output_dir>/
                 <bid_id>/
-                    <stem>.json   (Full Pydantic serialized schema)
                     <stem>.md     (Page-anchored Markdown representation)
+                    <stem>.json   (Optional serialized schema if export_json=True)
                 parsing_manifest.json (Global audit index and metrics)
-
-        Args:
-            parsed_documents: Collection of parsed documents mapped by bid_id or list.
-            output_dir: Destination base directory.
-
-        Returns:
-            Resolved Path to the written parsing_manifest.json.
         """
-        out_base = Path(output_dir).resolve()
+        out_base = Path(output_dir)
+        if not out_base.is_absolute():
+            # If running from inside backend and relative path points to project root output
+            if not out_base.exists() and (Path.cwd().parent / output_dir).exists():
+                out_base = (Path.cwd().parent / output_dir).resolve()
+            elif not out_base.exists() and (_PROJECT_ROOT / output_dir).exists():
+                out_base = (_PROJECT_ROOT / output_dir).resolve()
+            else:
+                out_base = out_base.resolve()
+        else:
+            out_base = out_base.resolve()
+
         out_base.mkdir(parents=True, exist_ok=True)
 
         # Normalize into a flat list of ParsedDocument
@@ -292,9 +313,15 @@ class IngestionPipeline:
 
             stem = Path(doc.file_name).stem
 
-            # 1. Export validated JSON
-            json_file = bid_folder / f"{stem}.json"
-            json_file.write_text(doc.model_dump_json(indent=2), encoding="utf-8")
+            # 1. Optionally export validated JSON
+            rel_json = None
+            if export_json:
+                json_file = bid_folder / f"{stem}.json"
+                json_file.write_text(doc.model_dump_json(indent=2), encoding="utf-8")
+                try:
+                    rel_json = str(json_file.relative_to(out_base.parent)).replace("\\", "/")
+                except ValueError:
+                    rel_json = str(json_file).replace("\\", "/")
 
             # 2. Export layout-aware Markdown
             md_file = bid_folder / f"{stem}.md"
@@ -314,10 +341,8 @@ class IngestionPipeline:
 
             # Compute relative paths for portability
             try:
-                rel_json = str(json_file.relative_to(out_base.parent)).replace("\\", "/")
                 rel_md = str(md_file.relative_to(out_base.parent)).replace("\\", "/")
             except ValueError:
-                rel_json = str(json_file).replace("\\", "/")
                 rel_md = str(md_file).replace("\\", "/")
 
             manifest_entries.append(
@@ -377,19 +402,25 @@ class IngestionPipeline:
         self,
         data_dir: Path | str,
         output_dir: Path | str,
+        export_json: bool = False,
     ) -> dict[str, Any]:
         """Executes full end-to-end ingestion and persistence.
 
         Args:
             data_dir: Root directory containing bid folders.
-            output_dir: Directory where parsed JSON/Markdown will be saved.
+            output_dir: Directory where parsed Markdown will be saved.
+            export_json: Whether to also write raw Pydantic JSON files.
 
         Returns:
             Dictionary containing processing summary and metrics.
         """
         overall_start = time.perf_counter()
         parsed_docs = self.process_all_bids(data_dir=data_dir)
-        manifest_path = self.export_artifacts(parsed_documents=parsed_docs, output_dir=output_dir)
+        manifest_path = self.export_artifacts(
+            parsed_documents=parsed_docs,
+            output_dir=output_dir,
+            export_json=export_json,
+        )
 
         total_docs = sum(len(docs) for docs in parsed_docs.values())
         total_pages = sum(sum(p.total_pages for p in docs) for docs in parsed_docs.values())
@@ -421,7 +452,12 @@ def main() -> None:
         "--output-dir",
         type=str,
         default="output/parsed",
-        help="Destination directory for parsed JSON and Markdown (default: output/parsed)",
+        help="Destination directory for parsed Markdown (default: output/parsed)",
+    )
+    parser.add_argument(
+        "--save-json",
+        action="store_true",
+        help="Also export full Pydantic JSON schemas alongside Markdown",
     )
     parser.add_argument(
         "--no-ocr",
@@ -442,7 +478,11 @@ def main() -> None:
         max_pages=args.max_pages,
     )
 
-    result = pipeline.run(data_dir=args.data_dir, output_dir=args.output_dir)
+    result = pipeline.run(
+        data_dir=args.data_dir,
+        output_dir=args.output_dir,
+        export_json=args.save_json,
+    )
 
     print("\n" + "=" * 60)
     print("Ingestion Pipeline Execution Completed Successfully!")
